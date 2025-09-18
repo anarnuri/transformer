@@ -75,20 +75,3 @@ class SingleTransformerDataset(Dataset):
             "decoder_input_continuous": decoder_input_continuous,
             "label_continuous": label_continuous,
         }
-
-# Usage
-if __name__ == "__main__":
-    data_dir = "/home/anurizada/Documents/processed_dataset"
-    
-    # Use the appropriate version based on where your method is defined
-    dataset = SingleTransformerDataset(
-        data_dir=data_dir,
-        kappa=1.0,
-        num_bins=200,
-        use_binning=True
-    )
-    
-    sample = dataset[0]
-    print(f"Sample 0 - Text label: {sample['text_label']}")
-    print(f"Decoder input: {sample['decoder_input'][:5]}")
-    print(f"Label: {sample['label'][:5]}")

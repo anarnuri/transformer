@@ -1,4 +1,6 @@
 results/
 weights/
+__pycache__/
+.vscode/
 
 *.npy
