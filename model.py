@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 import math
-from utils import preprocess_curves
 from torch.nn import MultiheadAttention
 
 def _init_weights(m):
@@ -50,20 +49,28 @@ class FeedForwardBlock(nn.Module):
         return self.dropout(x)
 
 class InputEmbeddings(nn.Module):
-
-    def __init__(self, d_model: int, input_size: int, bias: bool=True) -> None:
+    def __init__(self, d_model: int, vocab_size: int, bias: bool=True) -> None:  # Changed from input_size to vocab_size
         super().__init__()
         self.d_model = d_model
-        self.input_size = input_size
-        self.embedding = nn.Linear(self.input_size, self.d_model, bias=bias)
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(vocab_size, d_model)  # Use Embedding layer instead of Linear
 
     def forward(self, x) -> torch.Tensor:
-        # (batch, seq_len, input_size) --> (batch, seq_len, d_model)
-        # Multiply by sqrt(d_model) to scale the embeddings according to the paper
+        # (batch, seq_len) --> (batch, seq_len, d_model)
         return self.embedding(x) * math.sqrt(self.d_model)
 
-class PositionalEncoding(nn.Module):
+class LabelEmbedding(nn.Module):
+    def __init__(self, d_model: int, num_labels: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.embedding = nn.Embedding(num_labels, d_model)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (batch,) --> (batch, d_model)
+        embedded = self.embedding(x)
+        return embedded * math.sqrt(self.d_model)
+
+class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, seq_len: int, dropout: float=0.0) -> None:
         super().__init__()
         self.d_model = d_model
@@ -89,7 +96,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
     
 class Encoder(nn.Module):
-
     def __init__(self, dim: int, n_heads: int, seq_len: int, dropout: float = 0.0) -> None:
         super().__init__()
 
@@ -99,16 +105,14 @@ class Encoder(nn.Module):
         self.dropout = dropout
         self.seq_len = seq_len
         
-        # Replace custom Attention with PyTorch's MultiheadAttention
         self.attention = MultiheadAttention(
             embed_dim=self.dim,
             num_heads=self.n_heads,
             dropout=self.dropout,
-            bias=True,  # Keep bias (unlike your original)
-            batch_first=True  # (B, Seq_Len, Dim) format
+            bias=True,
+            batch_first=True
         )
 
-        # self.attention = Attention(self.dim, self.n_heads, self.seq_len)
         self.feed_forward = FeedForwardBlock(self.dim)
 
         # Normalization BEFORE the attention block
@@ -120,8 +124,6 @@ class Encoder(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         x_n = self.attention_norm(x)
         
-        # PyTorch's MultiheadAttention expects mask shape:
-        # (B, Seq_Len) for key_padding_mask (1 for padded positions)
         attn_output, _ = self.attention(
             query=x_n,
             key=x_n,
@@ -149,7 +151,7 @@ class Decoder(nn.Module):
             batch_first=True
         )
         
-        # Cross-attention (now using MultiheadAttention)
+        # Cross-attention
         self.cross_attention = MultiheadAttention(
             embed_dim=dim,
             num_heads=n_heads,
@@ -171,8 +173,6 @@ class Decoder(nn.Module):
         # ===== 1. Self-Attention =====
         x_n = self.self_attention_norm(x)
         
-        # tgt_mask = ~tgt_mask
-
         attn_mask = None
         if tgt_mask is not None:
             if tgt_mask.dim() == 3:  # [B, T, T]
@@ -195,13 +195,11 @@ class Decoder(nn.Module):
         # ===== 2. Cross-Attention =====
         out_n = self.cross_attention_norm(h)
         
-        # Cross-attention: query=decoder, key/value=encoder
-
         cross_attn_out, _ = self.cross_attention(
             query=out_n,
             key=encoder_output,
             value=encoder_output,
-            key_padding_mask=src_mask,  # src_mask should be [B,S] if used
+            key_padding_mask=src_mask,
             need_weights=False
         )
         h = h + cross_attn_out
@@ -211,13 +209,6 @@ class Decoder(nn.Module):
         
         return self.final_norm(out)
     
-class Identity(nn.Module):
-    def __init__(self):
-        super(Identity, self).__init__()
-
-    def forward(self, x):
-        return x
-
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, dropout=0.0):
         super().__init__()
@@ -244,10 +235,10 @@ class ProjectionHead(nn.Module):
         return self.fc_out(x)
 
 class ContrastiveEncoder(nn.Module):
-    def __init__(self, in_channels=1, emb_size=128):
+    def __init__(self, in_channels=3, emb_size=128):
         super().__init__()
         self.convnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        self.convnet.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.convnet.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.convnet.fc = nn.Identity()
         self.projector = ProjectionHead(2048, 1024, emb_size)
 
@@ -256,58 +247,63 @@ class ContrastiveEncoder(nn.Module):
         return self.projector(features)
 
 class SingleImageTransformer(nn.Module):
-    def __init__(self, tgt_seq_len: int, output_size: int, d_model: int=1024, h: int=32, N: int=6):
+    def __init__(self, tgt_seq_len: int = 25, vocab_size: int = 204, d_model: int = 512, 
+                 h: int = 8, N: int = 6, num_labels: int = 105):
         super(SingleImageTransformer, self).__init__()
         self.tgt_seq_len = tgt_seq_len
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_labels = num_labels
 
         # Positional Encoding for encoder and decoder
         self.encoder_positional_encoding = PositionalEncoding(d_model, seq_len=2)
         self.decoder_positional_encoding = PositionalEncoding(d_model, seq_len=tgt_seq_len)
         
-        # Embeddings and Encoder
-        self.tgt_embed = InputEmbeddings(d_model, output_size, bias=False)
+        # Embeddings - FIXED: Use vocab_size for target embedding
+        self.tgt_embed = InputEmbeddings(d_model, vocab_size, bias=False)  # Changed to vocab_size
+        self.label_embed = LabelEmbedding(d_model, num_labels)
+        
+        # Encoder and Decoder
         self.encoder = nn.ModuleList([Encoder(d_model, h, seq_len=2) for _ in range(N)])
-
-        # Single decoder
         self.decoder = nn.ModuleList([Decoder(d_model, h, tgt_seq_len) for _ in range(N)])
 
-        # Projection layer
-        self.projection = nn.Linear(d_model, output_size, bias=False)
+        # Projection layer - output vocab probabilities
+        self.projection = nn.Linear(d_model, vocab_size, bias=False)
         self.projection_norm = RMSNorm(d_model, eps=1e-5)
 
-        # Add Contrastive_Curve and GraphHop models
-        self.contrastive_curve = ContrastiveEncoder(in_channels=1, emb_size=d_model)
-        self.contrastive_adj = ContrastiveEncoder(in_channels=1, emb_size=d_model)
+        # Image encoder
+        self.image_encoder = ContrastiveEncoder(in_channels=1, emb_size=d_model)
 
         # Initialize weights
-        for m in [
-            self.encoder,
-            self.decoder,
-            self.projection,
-            self.tgt_embed,
-        ]:
+        for m in [self.encoder, self.decoder, self.projection, self.tgt_embed, self.label_embed]:
             m.apply(_init_weights)
     
-    def encode(self, curve_data, adj_data):
-        # Process curve data with Contrastive_Curve
-        curve_embedding = self.contrastive_curve(curve_data).unsqueeze(1)  # Shape: (batch_size, d_model)
-        # Process graph data with GraphHop
-        adj_embedding = self.contrastive_adj(adj_data).unsqueeze(1)  # Shape: (batch_size, d_model)
+    def encode(self, image_data, labels):
+        # Process image data
+        image_embedding = self.image_encoder(image_data).unsqueeze(1)  # Shape: (batch_size, 1, d_model)
+        
+        # Process labels with embedding layer
+        label_embedding = self.label_embed(labels).unsqueeze(1)  # Shape: (batch_size, 1, d_model)
 
-        combined_embedding = torch.cat([curve_embedding, adj_embedding], dim=1)
+        # Combine image and label embeddings
+        combined_embedding = torch.cat([image_embedding, label_embedding], dim=1)
 
-        # Add positional encoding to the combined embeddings
-        src = self.encoder_positional_encoding(combined_embedding)  # Shape: (batch_size, 1, d_model)
+        # Add positional encoding
+        src = self.encoder_positional_encoding(combined_embedding)  # Shape: (batch_size, 2, d_model)
 
         # Pass through encoder layers
         for layer in self.encoder:
-            src = layer(src)  # Shape: (batch_size, 1, d_model)
+            src = layer(src)
 
-        return src, curve_embedding, adj_embedding
+        return src, image_embedding, label_embedding
 
     def decode(self, encoder_output, src_mask, tgt, tgt_mask):
-        # Embed the target sequence and add positional encoding
-        tgt = self.tgt_embed(tgt)
+        # # Embed the target sequence and add positional encoding
+        # print(f"[DEBUG] Target tensor shape: {tgt.shape}")
+        # print(f"[DEBUG] Target tensor dtype: {tgt.dtype}")
+        # print(f"[DEBUG] Target min value: {tgt.min().item()}")
+        # print(f"[DEBUG] Target max value: {tgt.max().item()}")
+        tgt = self.tgt_embed(tgt)  # Input shape: (batch, seq_len), Output: (batch, seq_len, d_model)
         tgt = self.decoder_positional_encoding(tgt)
 
         # Apply decoder layers
@@ -316,9 +312,13 @@ class SingleImageTransformer(nn.Module):
 
         return tgt
     
-    def forward(self, decoder_input, decoder_mask, curve_data, adj_data):
-        # Encode source input with curve and graph data
-        encoder_output, curve_embedding, adj_embedding = self.encode(curve_data, adj_data)
+    def forward(self, decoder_input, decoder_mask, image_data, labels):
+        # decoder_input shape: (batch, seq_len) - token indices
+        # image_data shape: (batch, 3, H, W) - RGB images
+        # labels shape: (batch,) - label indices
+        
+        # Encode source input with image and label data
+        encoder_output, image_embedding, label_embedding = self.encode(image_data, labels)
         
         # Decoder pass
         decoder_output = self.decode(
@@ -329,86 +329,6 @@ class SingleImageTransformer(nn.Module):
         )
         
         decoder_output = self.projection_norm(decoder_output)
-        final_output = self.projection(decoder_output)
+        final_output = self.projection(decoder_output)  # Shape: (batch, seq_len, vocab_size)
 
-        return final_output, curve_embedding, adj_embedding
-
-class SingleTransformer(nn.Module):
-    def __init__(self, tgt_seq_len: int, output_size: int, d_model: int=1024, h: int=32, N: int=6):
-        super(SingleTransformer, self).__init__()
-        self.tgt_seq_len = tgt_seq_len
-
-        # Positional Encoding for encoder and decoder
-        self.encoder_positional_encoding = PositionalEncoding(d_model, seq_len=2)
-        self.decoder_positional_encoding = PositionalEncoding(d_model, seq_len=tgt_seq_len)
-        
-        # Embeddings and Encoder
-        self.tgt_embed = InputEmbeddings(d_model, output_size, bias=False)
-        self.encoder = nn.ModuleList([Encoder(d_model, h, seq_len=2) for _ in range(N)])
-
-        # Single decoder
-        self.decoder = nn.ModuleList([Decoder(d_model, h, tgt_seq_len) for _ in range(N)])
-
-        # Projection layer
-        self.projection = nn.Linear(d_model, output_size, bias=False)
-        self.projection_norm = RMSNorm(d_model, eps=1e-5)
-
-        # Add Contrastive_Curve and GraphHop models
-        self.contrastive_curve = ContrastiveEncoder(in_channels=1, emb_size=d_model)
-        self.contrastive_adj = ContrastiveEncoder(in_channels=1, emb_size=d_model)
-
-        # Initialize weights
-        for m in [
-            self.encoder,
-            self.decoder,
-            self.projection,
-            self.tgt_embed,
-        ]:
-            m.apply(_init_weights)
-    
-    def encode(self, curve_data, adj_data):
-        curve_data = preprocess_curves(curves=curve_data).unsqueeze(1)
-
-        # Process curve data with Contrastive_Curve
-        curve_embedding = self.contrastive_curve(curve_data).unsqueeze(1)  # Shape: (batch_size, d_model)
-        # Process graph data with GraphHop
-        adj_embedding = self.contrastive_adj(adj_data).unsqueeze(1)  # Shape: (batch_size, d_model)
-
-        combined_embedding = torch.cat([curve_embedding, adj_embedding], dim=1)
-
-        # Add positional encoding to the combined embeddings
-        src = self.encoder_positional_encoding(combined_embedding)  # Shape: (batch_size, 1, d_model)
-
-        # Pass through encoder layers
-        for layer in self.encoder:
-            src = layer(src)  # Shape: (batch_size, 1, d_model)
-
-        return src, curve_embedding, adj_embedding
-
-    def decode(self, encoder_output, src_mask, tgt, tgt_mask):
-        # Embed the target sequence and add positional encoding
-        tgt = self.tgt_embed(tgt)
-        tgt = self.decoder_positional_encoding(tgt)
-
-        # Apply decoder layers
-        for layer in self.decoder:
-            tgt = layer(tgt, encoder_output, src_mask, tgt_mask)
-
-        return tgt
-    
-    def forward(self, decoder_input, decoder_mask, curve_data, adj_data):
-        # Encode source input with curve and graph data
-        encoder_output, curve_embedding, adj_embedding = self.encode(curve_data, adj_data)
-        
-        # Decoder pass
-        decoder_output = self.decode(
-            encoder_output, 
-            None, 
-            decoder_input, 
-            decoder_mask
-        )
-        
-        decoder_output = self.projection_norm(decoder_output)
-        final_output = self.projection(decoder_output)
-
-        return final_output, curve_embedding, adj_embedding
+        return final_output, image_embedding, label_embedding
