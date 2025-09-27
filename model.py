@@ -178,9 +178,11 @@ class Decoder(nn.Module):
             if tgt_mask.dim() == 3:  # [B, T, T]
                 # Convert to float and set masked positions to -inf
                 attn_mask = torch.zeros_like(tgt_mask, dtype=torch.float)
-                attn_mask.masked_fill_(tgt_mask, float('-inf'))
+                attn_mask.masked_fill_(~tgt_mask, float('-inf'))
                 # Expand for multi-head attention
                 attn_mask = attn_mask.repeat_interleave(self.n_heads, dim=0)
+
+        # print(attn_mask)
 
         self_attn_out, _ = self.self_attention(
             query=x_n,
@@ -237,10 +239,10 @@ class ProjectionHead(nn.Module):
 class ContrastiveEncoder(nn.Module):
     def __init__(self, in_channels=3, emb_size=128):
         super().__init__()
-        self.convnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.convnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)  # ResNet18 with ResNet18 weights
         self.convnet.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.convnet.fc = nn.Identity()
-        self.projector = ProjectionHead(2048, 1024, emb_size)
+        self.projector = ProjectionHead(2048, 1024, emb_size)  # Change 2048 to 512 for ResNet18
 
     def forward(self, x):
         features = self.convnet(x)

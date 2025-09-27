@@ -150,7 +150,7 @@ def train():
     torch.set_float32_matmul_precision('medium')
 
     # Hyperparameters
-    batch_size = 64  # Reduced for discrete prediction
+    batch_size = 512  # Reduced for discrete prediction
     num_epochs = 200
     lr = 1e-4  # Lower learning rate for classification
     clip_loss_weight = 0.5  # Reduced contrastive loss weight
@@ -261,8 +261,8 @@ def train():
                 # Backward pass and optimization
                 total_loss.backward()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # # Gradient clipping
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 # Log gradients and learning rates
                 if rank == 0:

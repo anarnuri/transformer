@@ -265,10 +265,21 @@ class ImageLinkageDataset(Dataset):
         mask[:num_real_tokens + 1] = True  # +1 for SOS token
         return mask
     
-    def _create_causal_mask(self, sequence_length):
-        """Create causal mask for decoder - FIXED shape"""
-        mask = torch.triu(torch.ones(sequence_length, sequence_length), diagonal=1).bool()
-        return ~mask  # True for allowed positions, False for masked
+    def _create_causal_mask(self, sequence_length, num_real_tokens):
+        """Create causal mask for decoder that accounts for padding tokens"""
+        # Create the base triangular causal mask
+        causal_mask = torch.triu(torch.ones(sequence_length, sequence_length), diagonal=1).bool()
+        causal_mask = ~causal_mask  # True for allowed positions, False for masked
+        
+        # Create padding mask: False for padding tokens, True for real tokens
+        padding_mask = torch.zeros(sequence_length, dtype=torch.bool)
+        padding_mask[:num_real_tokens + 1] = True  # +1 for SOS token
+        
+        # Combine causal mask with padding mask
+        # For each position, we need to mask out padding tokens in both rows and columns
+        final_mask = causal_mask & padding_mask.unsqueeze(0) & padding_mask.unsqueeze(1)
+        
+        return final_mask
     
     def _shuffle_data(self):
         """Shuffle the dataset"""
@@ -299,9 +310,9 @@ class ImageLinkageDataset(Dataset):
         max_seq_len = self.max_joints * 2 + 1
         num_real_tokens = sequences['num_joints'] * 2
         
-        # Create masks
+        # Create masks - UPDATED to include num_real_tokens
         attention_mask = self._create_attention_mask(max_seq_len, num_real_tokens)
-        causal_mask = self._create_causal_mask(max_seq_len)
+        causal_mask = self._create_causal_mask(max_seq_len, num_real_tokens)  # Updated call
         
         return {
             "image": image_tensor,
@@ -311,12 +322,11 @@ class ImageLinkageDataset(Dataset):
             "decoder_input_discrete": torch.tensor(sequences['discrete']['decoder_input'], dtype=torch.long),
             "label_discrete": torch.tensor(sequences['discrete']['label'], dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
-            "causal_mask": causal_mask,  # Already a tensor from _create_causal_mask
+            "causal_mask": causal_mask,  # Now properly handles padding
             "encoded_label": torch.tensor(self.label_to_index.get(text_label, 0), dtype=torch.long),
             "num_joints": sequences['num_joints'],
             "original_coords": sequences['original_coords']
         }
-
 
 def inspect_dataset(dataset, num_samples=5):
     """Comprehensive function to inspect dataset samples and verify correctness"""

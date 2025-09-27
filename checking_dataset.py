@@ -73,7 +73,7 @@ def inspect_npy_files(data_dir):
                         else:
                             print(f"  Min: {entry_data.min():.3f}, Max: {entry_data.max():.3f}")
                             if 'causal' in file_name:
-                                print(f"  Mask pattern (first 10x10):\n{entry_data[:10, :10]}")
+                                print(f"  Mask pattern (first 10x10):\n{entry_data[:, :]}")
                                 
                     elif entry_data.ndim == 3:
                         print(f"  Shape: {entry_data.shape}")
