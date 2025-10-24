@@ -261,18 +261,19 @@ class InferenceEngine:
 
 
 def main():
-    checkpoint_path = "weights/d2048_h32_n6_bs1024_lr0.0001_best.pth"
-    data_dir = "/home/anurizada/Documents/processed_dataset"
+    checkpoint_path = "weights/d2048_h32_n6_bs1024_lr0.0001.pth"
+    data_dir = "/home/anurizada/Documents/processed_dataset_105"
     batch_size = 10
     
     inferencer = InferenceEngine(checkpoint_path)
     dataset = BarLinkageDataset(data_dir=data_dir)
+    dataset = torch.utils.data.Subset(dataset, range(1000000))
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
     # --- Run iterative inference with Top-K ---
     print("Running iterative inference with top-k sampling...")
     predictions_iter, targets_iter = inferencer.predict_iterative(
-        dataloader, max_samples=10, top_k=10, temperature=0.9, use_top_k=True
+        dataloader, max_samples=10, top_k=10, temperature=0.9, use_top_k=False
     )
     
     # --- Run batch inference (teacher forcing) ---
