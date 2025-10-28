@@ -20,6 +20,10 @@ EOS_TOKEN = 1    # End of sequence
 PAD_TOKEN = 2    # Padding
 NUM_SPECIAL_TOKENS = 3
 
+# Offsets per your spec
+MECH_OFFSET = 3    # 3..19 (17 mech types)
+BIN_OFFSET  = 20   # bins start at 20
+
 
 # ------------------------------------------------------------------
 # Coordinate Binner
@@ -161,11 +165,14 @@ class ImageLinkageDataset(Dataset):
     # Sequence creation and masking
     # --------------------------------------------------------------
     def _create_sequences(self, coordinates, text_label):
-        max_seq_len = self.max_joints * 2 + 1
+        # CHANGED: +2 to fit [SOS, MECH, ...bins...] and [MECH, ...bins..., EOS]
+        max_seq_len = self.max_joints * 2 + 2
+
         flat = coordinates.flatten() if coordinates is not None else np.array([])
         n_coords = min(len(flat), self.max_joints * 2)
         coords = flat[:n_coords]
 
+        # --- Continuous (unchanged logic/placement to keep minimal diffs) ---
         decoder_input_continuous = np.full(max_seq_len, -1.0)
         label_continuous = np.full(max_seq_len, -1.0)
         decoder_input_continuous[0] = -2.0
@@ -173,14 +180,25 @@ class ImageLinkageDataset(Dataset):
         label_continuous[:n_coords] = coords
         label_continuous[n_coords] = 2.0
 
+        # --- Discrete (UPDATED to your spec) ---
         decoder_input_discrete = np.full(max_seq_len, PAD_TOKEN, dtype=int)
         label_discrete = np.full(max_seq_len, PAD_TOKEN, dtype=int)
-        if n_coords > 0:
-            binned = self.binner.value_to_bin(coords) + NUM_SPECIAL_TOKENS
-            decoder_input_discrete[1:1+n_coords] = binned
-            label_discrete[:n_coords] = binned
+
+        mech_idx = self.label_to_index[text_label]  # 0..16
+        mech_token = MECH_OFFSET + mech_idx         # 3..19
+        binned = self.binner.value_to_bin(coords) + BIN_OFFSET if n_coords > 0 else np.array([], dtype=int)
+
+        # Decoder input: [SOS, MECH, BIN..., PAD...]
         decoder_input_discrete[0] = SOS_TOKEN
-        label_discrete[n_coords] = EOS_TOKEN
+        decoder_input_discrete[1] = mech_token
+        if n_coords > 0:
+            decoder_input_discrete[2:2+n_coords] = binned
+
+        # Label: [MECH, BIN..., EOS, PAD...]
+        label_discrete[0] = mech_token
+        if n_coords > 0:
+            label_discrete[1:1+n_coords] = binned
+        label_discrete[1 + n_coords] = EOS_TOKEN
 
         return {
             "continuous": {"decoder_input": decoder_input_continuous, "label": label_continuous},
@@ -191,15 +209,17 @@ class ImageLinkageDataset(Dataset):
         }
 
     def _create_attention_mask(self, sequence_length, num_real_tokens):
+        # CHANGED: cover SOS + MECH + n_coords bins
         mask = np.zeros(sequence_length, dtype=bool)
-        mask[:num_real_tokens + 1] = True
+        mask[:num_real_tokens + 2] = True
         return mask
 
     def _create_causal_mask(self, sequence_length, num_real_tokens):
+        # CHANGED: cover SOS + MECH + n_coords bins
         causal_mask = torch.triu(torch.ones(sequence_length, sequence_length), diagonal=1).bool()
         causal_mask = ~causal_mask
         padding_mask = torch.zeros(sequence_length, dtype=torch.bool)
-        padding_mask[:num_real_tokens + 1] = True
+        padding_mask[:num_real_tokens + 2] = True
         return causal_mask & padding_mask.unsqueeze(0) & padding_mask.unsqueeze(1)
 
     def _shuffle_data(self):
@@ -224,7 +244,9 @@ class ImageLinkageDataset(Dataset):
             image_tensor = torch.zeros((3, 64, 64))
 
         seq = self._create_sequences(coords, label)
-        max_len = self.max_joints * 2 + 1
+
+        # CHANGED: +2 to match the new max_seq_len above
+        max_len = self.max_joints * 2 + 2
         num_real = seq["num_joints"] * 2
         attn_mask = self._create_attention_mask(max_len, num_real)
         causal_mask = self._create_causal_mask(max_len, num_real)
@@ -323,7 +345,8 @@ def create_npy_files(dataset, output_dir):
     np.save(os.path.join(output_dir, "text_labels.npy"), np.array(all_text_labels, dtype=object))
     np.save(os.path.join(output_dir, "encoded_labels.npy"), all_encoded_labels)
 
-    vocab_size = NUM_SPECIAL_TOKENS + dataset.num_bins
+    # CHANGED: vocab size accounts for mech block and bin block (bins start at BIN_OFFSET)
+    vocab_size = BIN_OFFSET + dataset.num_bins
     with open(os.path.join(output_dir, "label_mapping.json"), 'w') as f:
         json.dump({
             'label_to_index': dataset.label_to_index,
@@ -332,7 +355,9 @@ def create_npy_files(dataset, output_dir):
             'num_bins': dataset.num_bins,
             'coordinate_range': [-10, 10],
             'vocab_size': vocab_size,
-            'label_vocab_size': len(dataset.label_to_index)
+            'label_vocab_size': len(dataset.label_to_index),
+            'mech_token_offset': MECH_OFFSET,
+            'bin_token_offset': BIN_OFFSET
         }, f, indent=2)
 
     print(f"\nFiles saved to {output_dir} successfully.")

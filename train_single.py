@@ -231,10 +231,8 @@ def train(checkpoint_path=None, use_strict_resume=False):
     BIN_OFFSET = NUM_SPECIAL_TOKENS  # the vocab index where bin 0 maps to
 
     # Dataset (unchanged)
-    dataset = BarLinkageDataset(data_dir='/home/anurizada/Documents/processed_dataset')
+    dataset = BarLinkageDataset(data_dir='/home/anurizada/Documents/processed_dataset_17')
     
-    dataset = torch.utils.data.Subset(dataset, range(1000000))
-
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
