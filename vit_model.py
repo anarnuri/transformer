@@ -301,4 +301,209 @@ class SingleImageTransformer(nn.Module):
 
         # LM head
         logits = self.projection(dec_out)  # (B, T, V)
+
+        # print(f"decoder_input_ids: {decoder_input_ids.shape}")
+        # print(f"decoder_mask: {decoder_mask.shape}")
+        # print(f"image_data: {image_data.shape}")
+        # print(f"memory: {memory.shape}")
+        # print(f"tgt_key_padding_mask: {tgt_key_padding_mask.shape}")
+        # print(f"dec_out: {dec_out.shape}")
+        # print(f"logits: {logits.shape}")
+
+        return logits
+
+
+class SingleImageTransformerCLIP(nn.Module):
+    def __init__(
+        self,
+        tgt_seq_len: int = 25,
+        vocab_size: int = 204,
+        d_model: int = 512,
+        h: int = 8,
+        N: int = 6,
+        num_labels: int = 17,      # mech types
+        dropout: float = 0.1,
+        img_in_channels: int = 1,
+        img_size: int = 64,
+        img_patch: int = 8,
+        pad_token_id: int = 2,
+    ):
+        super().__init__()
+        self.tgt_seq_len = tgt_seq_len
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_labels = num_labels
+        self.pad_token_id = pad_token_id
+
+        # --- target + mech embeddings ---
+        self.tgt_embed = InputEmbeddings(d_model, vocab_size)
+        self.mech_embedding = nn.Embedding(num_labels, d_model)
+        # +1 because we prepend the mech token
+        self.decoder_positional_encoding = PositionalEncoding(
+            d_model, seq_len=tgt_seq_len + 1, dropout=dropout
+        )
+
+        # --- image encoder ---
+        self.image_encoder = ViTEncoder(
+            emb_size=d_model,
+            in_channels=img_in_channels,
+            image_size=img_size,
+            patch_size=img_patch,
+            num_layers=N,
+            nhead=h,
+            dropout=dropout,
+        )
+
+        # --- decoder ---
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=h,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=N)
+
+        # --- head ---
+        self.projection = nn.Linear(d_model, vocab_size)
+
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.xavier_uniform_(m.weight)
+            if getattr(m, "bias", None) is not None:
+                nn.init.zeros_(m.bias)
+
+    # ------------------------------------------------------------------
+    # Mask makers
+    # ------------------------------------------------------------------
+    def _make_causal_attn_mask(self, L: int, device):
+        """
+        Return a standard 2D causal mask that PyTorch likes:
+        shape (L, L), float, 0 on allowed, -inf on disallowed.
+        """
+        # bool lower-triangular
+        mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
+        # convert to float mask
+        float_mask = torch.zeros(L, L, device=device, dtype=torch.float32)
+        float_mask.masked_fill_(~mask, float("-inf"))
+        return float_mask  # (L, L)
+
+    # ------------------------------------------------------------------
+    # encode / decode / forward
+    # ------------------------------------------------------------------
+    def encode(self, image_data: torch.Tensor) -> torch.Tensor:
+        # (B, C, H, W) -> (B, N, D)
+        return self.image_encoder(image_data)
+
+    def decode(
+        self,
+        memory: torch.Tensor,       # (B, N, D)
+        tgt_ids: torch.Tensor,      # (B, T)
+        mech_labels: torch.Tensor,  # (B,)
+        tgt_key_padding_mask: torch.Tensor = None,  # (B, T)
+    ) -> torch.Tensor:
+        print("\n[DEBUG] ===== DECODE START =====")
+        print(f"memory: shape={memory.shape}, dtype={memory.dtype}, device={memory.device}")
+        print(f"tgt_ids: shape={tgt_ids.shape}, dtype={tgt_ids.dtype}, device={tgt_ids.device}")
+        print(f"mech_labels: shape={mech_labels.shape}, dtype={mech_labels.dtype}, device={mech_labels.device}")
+        if tgt_key_padding_mask is not None:
+            print(f"tgt_key_padding_mask: shape={tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
+
+        B, T = tgt_ids.shape
+        device = tgt_ids.device
+
+        # 1) mech token (B, 1, D)
+        mech_emb = self.mech_embedding(mech_labels).unsqueeze(1)
+        print(f"[DEBUG] mech_emb: {mech_emb.shape}")
+
+        # 2) normal target tokens (B, T, D)
+        tgt = self.tgt_embed(tgt_ids)
+        print(f"[DEBUG] tgt (before concat): {tgt.shape}")
+
+        # 3) prepend mech -> (B, T+1, D)
+        tgt = torch.cat([mech_emb, tgt], dim=1)
+        print(f"[DEBUG] tgt (after concat): {tgt.shape}")
+
+        # 4) add positions
+        tgt = self.decoder_positional_encoding(tgt)
+        print(f"[DEBUG] tgt (after positional): {tgt.shape}")
+
+        # 5) build standard causal mask for length T+1
+        L = T + 1
+        causal_mask = self._make_causal_attn_mask(L, device)  # (L, L)
+        print(f"[DEBUG] causal_mask: {causal_mask.shape}, dtype={causal_mask.dtype}, min={causal_mask.min().item():.3f}, max={causal_mask.max().item():.3f}")
+
+        # 6) extend key padding mask to account for mech token (never padded)
+        if tgt_key_padding_mask is not None:
+            mech_pad = torch.zeros((B, 1), dtype=torch.bool, device=device)
+            tgt_key_padding_mask = torch.cat([mech_pad, tgt_key_padding_mask], dim=1)
+            print(f"[DEBUG] tgt_key_padding_mask (after mech): {tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
+        else:
+            print("[DEBUG] tgt_key_padding_mask: None")
+
+        # Debug mask values (print small versions)
+        if L <= 20:  # only print for small seqs
+            print("[DEBUG] causal_mask (upper-left corner):")
+            print(causal_mask.cpu())
+
+        if tgt_key_padding_mask is not None and T <= 20:
+            print("[DEBUG] tgt_key_padding_mask (first few rows):")
+            print(tgt_key_padding_mask.cpu())
+
+        # 7) decoder
+        print("[DEBUG] calling TransformerDecoder...")
+        out = self.decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_mask=causal_mask,                  # (L, L) float mask
+            tgt_key_padding_mask=tgt_key_padding_mask,
+        )
+        print(f"[DEBUG] decoder output: {out.shape}")
+        print("[DEBUG] ===== DECODE END =====\n")
+
+        return out  # (B, T+1, D)
+
+
+    def forward(
+        self,
+        decoder_input_ids: torch.Tensor,  # (B, T)
+        _decoder_mask_unused: torch.Tensor,  # ignored, to keep old API
+        image_data: torch.Tensor,         # (B, 1, 64, 64)
+        mech_labels: torch.Tensor,        # (B,)
+    ) -> torch.Tensor:
+        print("\n[DEBUG] ===== FORWARD START =====")
+        print(f"decoder_input_ids: shape={decoder_input_ids.shape}, dtype={decoder_input_ids.dtype}, device={decoder_input_ids.device}")
+        print(f"image_data:         shape={image_data.shape}, dtype={image_data.dtype}, device={image_data.device}")
+        print(f"mech_labels:        shape={mech_labels.shape}, dtype={mech_labels.dtype}, device={mech_labels.device}")
+
+        # --- Encode image ---
+        memory = self.encode(image_data)
+        print(f"[DEBUG] memory: {memory.shape}, dtype={memory.dtype}")
+
+        # --- Key padding mask (PAD == True) ---
+        tgt_key_padding_mask = (decoder_input_ids == self.pad_token_id)
+        print(f"[DEBUG] tgt_key_padding_mask: {tgt_key_padding_mask.shape}, dtype={tgt_key_padding_mask.dtype}, sum={tgt_key_padding_mask.sum().item()}")
+
+        # --- Decode ---
+        dec_out = self.decode(
+            memory=memory,
+            tgt_ids=decoder_input_ids,
+            mech_labels=mech_labels,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+        )
+        print(f"[DEBUG] dec_out (raw): {dec_out.shape}, dtype={dec_out.dtype}")
+
+        # --- Drop mech token ---
+        dec_out = dec_out[:, 1:, :]   # (B, T, D)
+        print(f"[DEBUG] dec_out (after drop): {dec_out.shape}")
+
+        # --- Project to logits ---
+        logits = self.projection(dec_out)  # (B, T, V)
+        print(f"[DEBUG] logits: {logits.shape}, dtype={logits.dtype}, min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+
+        print("[DEBUG] ===== FORWARD END =====\n")
         return logits

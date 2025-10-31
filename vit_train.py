@@ -1,4 +1,3 @@
-# train_with_ce_mse_no_clip.py
 import os
 import math
 import numpy as np
@@ -11,6 +10,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import wandb
+import random 
 
 from vit_model import SingleImageTransformer
 from dataset import BarLinkageDataset
@@ -243,10 +243,25 @@ def train(checkpoint_path=None, use_strict_resume=False):
                 labels = batch["encoded_labels"].to(device)
                 target_tokens = batch["labels_discrete"].to(device)
 
+                # ----- Scheduled Sampling -----
+                if epoch > 400:
+                    ss_prob = min(0.2, 0.01 * (epoch - 10))
+                    if random.random() < ss_prob:
+                        with torch.no_grad():
+                            logits_ss = model(decoder_input, decoder_mask, images, labels)
+                            preds_ss = logits_ss.argmax(dim=-1)
+                        mask = (torch.rand_like(decoder_input.float()) < ss_prob)
+                        decoder_input = torch.where(mask, preds_ss, decoder_input)
+                # -----------------------------
+                
                 optimizer.zero_grad()
                 predictions = model(decoder_input, decoder_mask, images, labels)
 
                 ce_loss = cross_entropy_loss(predictions, target_tokens, pad_token=PAD_TOKEN)
+
+                total_loss = ce_loss
+                total_loss.backward()
+                optimizer.step()
 
                 # --- Optional MSE reconstruction loss ---
                 pred_tokens = predictions.argmax(dim=-1)
@@ -264,10 +279,6 @@ def train(checkpoint_path=None, use_strict_resume=False):
                     mse_loss = F.mse_loss(pred_cont[mse_mask], target_cont[mse_mask])
                 else:
                     mse_loss = torch.tensor(0.0, device=device)
-
-                total_loss = ce_loss + mse_weight * mse_loss
-                total_loss.backward()
-                optimizer.step()
 
                 # Accuracy
                 valid_mask = target_tokens != PAD_TOKEN
