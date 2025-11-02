@@ -3,5 +3,6 @@ weights/
 __pycache__/
 .vscode/
 wandb/
+JavascriptCode/
 
 *.npy

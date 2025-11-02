@@ -327,6 +327,7 @@ class SingleImageTransformerCLIP(nn.Module):
         img_size: int = 64,
         img_patch: int = 8,
         pad_token_id: int = 2,
+        debug: bool = False,       # <--- added global debug flag
     ):
         super().__init__()
         self.tgt_seq_len = tgt_seq_len
@@ -334,11 +335,11 @@ class SingleImageTransformerCLIP(nn.Module):
         self.d_model = d_model
         self.num_labels = num_labels
         self.pad_token_id = pad_token_id
+        self.debug = debug          # store debug flag globally
 
         # --- target + mech embeddings ---
         self.tgt_embed = InputEmbeddings(d_model, vocab_size)
         self.mech_embedding = nn.Embedding(num_labels, d_model)
-        # +1 because we prepend the mech token
         self.decoder_positional_encoding = PositionalEncoding(
             d_model, seq_len=tgt_seq_len + 1, dropout=dropout
         )
@@ -370,6 +371,9 @@ class SingleImageTransformerCLIP(nn.Module):
 
         self.apply(self._init_weights)
 
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
     @staticmethod
     def _init_weights(m):
         if isinstance(m, (nn.Linear, nn.Embedding)):
@@ -377,20 +381,25 @@ class SingleImageTransformerCLIP(nn.Module):
             if getattr(m, "bias", None) is not None:
                 nn.init.zeros_(m.bias)
 
+    def _dprint(self, *args, **kwargs):
+        """Conditional print helper based on self.debug flag."""
+        if self.debug:
+            print(*args, **kwargs)
+
+    def enable_debug(self, mode: bool = True):
+        """Toggle debugging globally."""
+        self.debug = mode
+        print(f"[DEBUG MODE] set to {self.debug}")
+
     # ------------------------------------------------------------------
     # Mask makers
     # ------------------------------------------------------------------
     def _make_causal_attn_mask(self, L: int, device):
-        """
-        Return a standard 2D causal mask that PyTorch likes:
-        shape (L, L), float, 0 on allowed, -inf on disallowed.
-        """
-        # bool lower-triangular
+        """Return a standard 2D causal mask with -inf for disallowed positions."""
         mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
-        # convert to float mask
         float_mask = torch.zeros(L, L, device=device, dtype=torch.float32)
         float_mask.masked_fill_(~mask, float("-inf"))
-        return float_mask  # (L, L)
+        return float_mask
 
     # ------------------------------------------------------------------
     # encode / decode / forward
@@ -406,87 +415,88 @@ class SingleImageTransformerCLIP(nn.Module):
         mech_labels: torch.Tensor,  # (B,)
         tgt_key_padding_mask: torch.Tensor = None,  # (B, T)
     ) -> torch.Tensor:
-        print("\n[DEBUG] ===== DECODE START =====")
-        print(f"memory: shape={memory.shape}, dtype={memory.dtype}, device={memory.device}")
-        print(f"tgt_ids: shape={tgt_ids.shape}, dtype={tgt_ids.dtype}, device={tgt_ids.device}")
-        print(f"mech_labels: shape={mech_labels.shape}, dtype={mech_labels.dtype}, device={mech_labels.device}")
+        self._dprint("\n[DEBUG] ===== DECODE START =====")
+        self._dprint(f"memory: {memory.shape} {memory.dtype} {memory.device}")
+        self._dprint(f"tgt_ids: {tgt_ids.shape} {tgt_ids.dtype} {tgt_ids.device}")
+        self._dprint(f"mech_labels: {mech_labels.shape} {mech_labels.dtype} {mech_labels.device}")
         if tgt_key_padding_mask is not None:
-            print(f"tgt_key_padding_mask: shape={tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
+            self._dprint(f"tgt_key_padding_mask: {tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
 
         B, T = tgt_ids.shape
         device = tgt_ids.device
 
         # 1) mech token (B, 1, D)
         mech_emb = self.mech_embedding(mech_labels).unsqueeze(1)
-        print(f"[DEBUG] mech_emb: {mech_emb.shape}")
+        self._dprint(f"[DEBUG] mech_emb: {mech_emb.shape}")
 
         # 2) normal target tokens (B, T, D)
         tgt = self.tgt_embed(tgt_ids)
-        print(f"[DEBUG] tgt (before concat): {tgt.shape}")
+        self._dprint(f"[DEBUG] tgt (before concat): {tgt.shape}")
 
         # 3) prepend mech -> (B, T+1, D)
         tgt = torch.cat([mech_emb, tgt], dim=1)
-        print(f"[DEBUG] tgt (after concat): {tgt.shape}")
+        self._dprint(f"[DEBUG] tgt (after concat): {tgt.shape}")
 
         # 4) add positions
         tgt = self.decoder_positional_encoding(tgt)
-        print(f"[DEBUG] tgt (after positional): {tgt.shape}")
+        self._dprint(f"[DEBUG] tgt (after positional): {tgt.shape}")
 
-        # 5) build standard causal mask for length T+1
+        # 5) causal mask (L, L)
         L = T + 1
-        causal_mask = self._make_causal_attn_mask(L, device)  # (L, L)
-        print(f"[DEBUG] causal_mask: {causal_mask.shape}, dtype={causal_mask.dtype}, min={causal_mask.min().item():.3f}, max={causal_mask.max().item():.3f}")
+        causal_mask = self._make_causal_attn_mask(L, device)
+        self._dprint(f"[DEBUG] causal_mask: {causal_mask.shape}, "
+                     f"min={causal_mask.min().item():.3f}, max={causal_mask.max().item():.3f}")
 
-        # 6) extend key padding mask to account for mech token (never padded)
+        # 6) extend padding mask
         if tgt_key_padding_mask is not None:
             mech_pad = torch.zeros((B, 1), dtype=torch.bool, device=device)
             tgt_key_padding_mask = torch.cat([mech_pad, tgt_key_padding_mask], dim=1)
-            print(f"[DEBUG] tgt_key_padding_mask (after mech): {tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
+            self._dprint(f"[DEBUG] tgt_key_padding_mask (after mech): "
+                         f"{tgt_key_padding_mask.shape}, sum(pad)={tgt_key_padding_mask.sum().item()}")
         else:
-            print("[DEBUG] tgt_key_padding_mask: None")
+            self._dprint("[DEBUG] tgt_key_padding_mask: None")
 
-        # Debug mask values (print small versions)
-        if L <= 20:  # only print for small seqs
-            print("[DEBUG] causal_mask (upper-left corner):")
-            print(causal_mask.cpu())
+        # Optional prints
+        if self.debug and L <= 20:
+            self._dprint("[DEBUG] causal_mask (upper-left corner):")
+            self._dprint(causal_mask.cpu())
 
-        if tgt_key_padding_mask is not None and T <= 20:
-            print("[DEBUG] tgt_key_padding_mask (first few rows):")
-            print(tgt_key_padding_mask.cpu())
+        if self.debug and tgt_key_padding_mask is not None and T <= 20:
+            self._dprint("[DEBUG] tgt_key_padding_mask (first few rows):")
+            self._dprint(tgt_key_padding_mask.cpu())
 
-        # 7) decoder
-        print("[DEBUG] calling TransformerDecoder...")
+        self._dprint("[DEBUG] calling TransformerDecoder...")
         out = self.decoder(
             tgt=tgt,
             memory=memory,
-            tgt_mask=causal_mask,                  # (L, L) float mask
+            tgt_mask=causal_mask,
             tgt_key_padding_mask=tgt_key_padding_mask,
         )
-        print(f"[DEBUG] decoder output: {out.shape}")
-        print("[DEBUG] ===== DECODE END =====\n")
+        self._dprint(f"[DEBUG] decoder output: {out.shape}")
+        self._dprint("[DEBUG] ===== DECODE END =====\n")
 
-        return out  # (B, T+1, D)
-
+        return out
 
     def forward(
         self,
         decoder_input_ids: torch.Tensor,  # (B, T)
-        _decoder_mask_unused: torch.Tensor,  # ignored, to keep old API
+        _decoder_mask_unused: torch.Tensor,  # ignored for compatibility
         image_data: torch.Tensor,         # (B, 1, 64, 64)
         mech_labels: torch.Tensor,        # (B,)
     ) -> torch.Tensor:
-        print("\n[DEBUG] ===== FORWARD START =====")
-        print(f"decoder_input_ids: shape={decoder_input_ids.shape}, dtype={decoder_input_ids.dtype}, device={decoder_input_ids.device}")
-        print(f"image_data:         shape={image_data.shape}, dtype={image_data.dtype}, device={image_data.device}")
-        print(f"mech_labels:        shape={mech_labels.shape}, dtype={mech_labels.dtype}, device={mech_labels.device}")
+        self._dprint("\n[DEBUG] ===== FORWARD START =====")
+        self._dprint(f"decoder_input_ids: {decoder_input_ids.shape} {decoder_input_ids.dtype} {decoder_input_ids.device}")
+        self._dprint(f"image_data:        {image_data.shape} {image_data.dtype} {image_data.device}")
+        self._dprint(f"mech_labels:       {mech_labels.shape} {mech_labels.dtype} {mech_labels.device}")
 
-        # --- Encode image ---
+        # --- Encode ---
         memory = self.encode(image_data)
-        print(f"[DEBUG] memory: {memory.shape}, dtype={memory.dtype}")
+        self._dprint(f"[DEBUG] memory: {memory.shape} {memory.dtype}")
 
-        # --- Key padding mask (PAD == True) ---
+        # --- Key padding mask ---
         tgt_key_padding_mask = (decoder_input_ids == self.pad_token_id)
-        print(f"[DEBUG] tgt_key_padding_mask: {tgt_key_padding_mask.shape}, dtype={tgt_key_padding_mask.dtype}, sum={tgt_key_padding_mask.sum().item()}")
+        self._dprint(f"[DEBUG] tgt_key_padding_mask: {tgt_key_padding_mask.shape}, "
+                     f"sum={tgt_key_padding_mask.sum().item()}")
 
         # --- Decode ---
         dec_out = self.decode(
@@ -495,15 +505,17 @@ class SingleImageTransformerCLIP(nn.Module):
             mech_labels=mech_labels,
             tgt_key_padding_mask=tgt_key_padding_mask,
         )
-        print(f"[DEBUG] dec_out (raw): {dec_out.shape}, dtype={dec_out.dtype}")
+
+        self._dprint(f"[DEBUG] dec_out (raw): {dec_out.shape} {dec_out.dtype}")
 
         # --- Drop mech token ---
-        dec_out = dec_out[:, 1:, :]   # (B, T, D)
-        print(f"[DEBUG] dec_out (after drop): {dec_out.shape}")
+        dec_out = dec_out[:, 1:, :]
+        self._dprint(f"[DEBUG] dec_out (after drop): {dec_out.shape}")
 
         # --- Project to logits ---
-        logits = self.projection(dec_out)  # (B, T, V)
-        print(f"[DEBUG] logits: {logits.shape}, dtype={logits.dtype}, min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+        logits = self.projection(dec_out)
+        self._dprint(f"[DEBUG] logits: {logits.shape} {logits.dtype}, "
+                     f"min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+        self._dprint("[DEBUG] ===== FORWARD END =====\n")
 
-        print("[DEBUG] ===== FORWARD END =====\n")
         return logits
