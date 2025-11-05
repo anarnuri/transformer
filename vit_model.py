@@ -519,3 +519,218 @@ class SingleImageTransformerCLIP(nn.Module):
         self._dprint("[DEBUG] ===== FORWARD END =====\n")
 
         return logits
+
+class SingleLatentTransformer(nn.Module):
+    """
+    Transformer decoder that conditions on VAE latent sequences (length 50).
+    The latent sequence is processed by a Transformer encoder to produce memory of shape (B, 50, D).
+    Includes mech-type embeddings and detailed debug printouts.
+    """
+
+    def __init__(
+        self,
+        tgt_seq_len: int = 25,
+        vocab_size: int = 204,
+        latent_dim: int = 50,
+        d_model: int = 512,
+        h: int = 8,
+        N: int = 6,
+        num_labels: int = 17,       # mechanism types
+        dropout: float = 0.1,
+        pad_token_id: int = 2,
+        noise_std: float = 0.05,    # amount of Gaussian noise added to latents
+        debug: bool = True,         # enable detailed shape printouts
+    ):
+        super().__init__()
+
+        # ----------------------------
+        # Basic parameters
+        # ----------------------------
+        self.tgt_seq_len = tgt_seq_len
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_labels = num_labels
+        self.pad_token_id = pad_token_id
+        self.noise_std = noise_std
+        self.debug = debug
+        self.latent_dim = latent_dim
+
+        # ----------------------------
+        # Embeddings
+        # ----------------------------
+        self.tgt_embed = nn.Embedding(vocab_size, d_model)
+        self.mech_embedding = nn.Embedding(num_labels, d_model)
+
+        # positional encoding for decoder tokens (+1 for mech token)
+        self.decoder_positional_encoding = self._build_positional_encoding(
+            d_model, seq_len=tgt_seq_len + 1
+        )
+
+        # ----------------------------
+        # Latent Transformer Encoder
+        # ----------------------------
+        # Treat latents (B, 50) as sequence of 50 scalar tokens
+        self.latent_proj = nn.Linear(1, d_model)  # project each scalar to D
+        self.latent_pos_encoding = self._build_positional_encoding(d_model, seq_len=latent_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=h,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.latent_encoder = nn.TransformerEncoder(encoder_layer, num_layers=N)
+        self.latent_norm = nn.LayerNorm(d_model)
+
+        # ----------------------------
+        # Transformer Decoder
+        # ----------------------------
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=h,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=N)
+
+        # ----------------------------
+        # Output projection
+        # ----------------------------
+        self.projection = nn.Linear(d_model, vocab_size)
+
+        self.apply(self._init_weights)
+        print("✅ Initialized SingleLatentTransformer (latent-sequence-based)")
+
+    # ------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.xavier_uniform_(m.weight)
+            if getattr(m, "bias", None) is not None:
+                nn.init.zeros_(m.bias)
+
+    def _dprint(self, *args, **kwargs):
+        """Conditional print helper based on debug flag."""
+        if self.debug:
+            print(*args, **kwargs)
+
+    def _build_positional_encoding(self, d_model, seq_len):
+        """Create sinusoidal positional encodings."""
+        pe = torch.zeros(seq_len, d_model)
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return nn.Parameter(pe.unsqueeze(0), requires_grad=False)  # (1, seq_len, d_model)
+
+    def _make_causal_attn_mask(self, L: int, device):
+        mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
+        float_mask = torch.zeros(L, L, device=device, dtype=torch.float32)
+        float_mask.masked_fill_(~mask, float("-inf"))
+        return float_mask
+
+    # ------------------------------------------------------------
+    # Encode latent sequence
+    # ------------------------------------------------------------
+    def encode(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        latents: (B, latent_dim) or (B, latent_dim, 1)
+        Returns: memory (B, latent_dim, D)
+        """
+        if latents.dim() == 2:
+            latents = latents.unsqueeze(-1)  # (B, L, 1)
+        B, L, _ = latents.shape
+
+        # Add Gaussian noise during training
+        if self.training and self.noise_std > 0:
+            latents = latents + self.noise_std * torch.randn_like(latents)
+
+        # Project each latent dimension into d_model
+        x = self.latent_proj(latents)  # (B, L, D)
+        x = x + self.latent_pos_encoding[:, :L, :].to(latents.device)
+
+        self._dprint(f"[ENCODE] input latents: {latents.shape} -> projected: {x.shape}")
+
+        # Apply transformer encoder
+        memory = self.latent_encoder(x)
+        memory = self.latent_norm(memory)
+        self._dprint(f"[ENCODE] memory (after transformer): {memory.shape}")
+        return memory  # (B, L, D)
+
+    # ------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------
+    def forward(
+        self,
+        decoder_input_ids: torch.Tensor,  # (B, T)
+        _mask_unused: torch.Tensor,       # ignored
+        latents: torch.Tensor,            # (B, latent_dim) or (B, latent_dim, 1)
+        mech_labels: torch.Tensor,        # (B,)
+    ) -> torch.Tensor:
+        """
+        Returns logits: (B, T, vocab_size)
+        """
+        self._dprint("\n========== FORWARD START ==========")
+        self._dprint(f"decoder_input_ids: {decoder_input_ids.shape}")
+        self._dprint(f"latents: {latents.shape}")
+        self._dprint(f"mech_labels: {mech_labels.shape}")
+
+        B, T = decoder_input_ids.shape
+        device = latents.device
+
+        # --- Encode latent sequence ---
+        memory = self.encode(latents)  # (B, L, D)
+        self._dprint(f"[FORWARD] memory: {memory.shape}")
+
+        # --- Mech embedding ---
+        mech_emb = self.mech_embedding(mech_labels).unsqueeze(1)
+        self._dprint(f"[FORWARD] mech_emb: {mech_emb.shape}")
+
+        # --- Decoder tokens ---
+        tgt = self.tgt_embed(decoder_input_ids)
+        self._dprint(f"[FORWARD] tgt_embed: {tgt.shape}")
+
+        # prepend mech token
+        tgt = torch.cat([mech_emb, tgt], dim=1)
+        tgt = tgt + self.decoder_positional_encoding[:, :tgt.size(1), :].to(device)
+        self._dprint(f"[FORWARD] tgt (after concat + pos): {tgt.shape}")
+
+        # --- Causal mask ---
+        causal_mask = self._make_causal_attn_mask(T + 1, device)
+        tgt_key_padding_mask = (decoder_input_ids == self.pad_token_id)
+        mech_pad = torch.zeros((B, 1), dtype=torch.bool, device=device)
+        tgt_key_padding_mask = torch.cat([mech_pad, tgt_key_padding_mask], dim=1)
+        self._dprint(
+            f"[FORWARD] tgt_key_padding_mask: {tgt_key_padding_mask.shape}, pad_sum={tgt_key_padding_mask.sum().item()}"
+        )
+
+        # --- Decode ---
+        dec_out = self.decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+        )
+        self._dprint(f"[FORWARD] decoder output: {dec_out.shape}")
+
+        # --- Drop mech token ---
+        dec_out = dec_out[:, 1:, :]
+        self._dprint(f"[FORWARD] dec_out (after drop): {dec_out.shape}")
+
+        # --- Project to logits ---
+        logits = self.projection(dec_out)
+        self._dprint(
+            f"[FORWARD] logits: {logits.shape}, min={logits.min().item():.3f}, max={logits.max().item():.3f}"
+        )
+        self._dprint("========== FORWARD END ==========\n")
+
+        return logits

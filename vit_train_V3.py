@@ -1,6 +1,5 @@
 import os
 import math
-import random
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,17 +7,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import random_split, DistributedSampler, DataLoader
 from torch.optim import Adam
-from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import wandb
 
-from vit_model import SingleImageTransformerCLIP
+from vit_model import SingleLatentTransformer  # <-- latent-based
 from dataset import BarLinkageDataset
 
 
-# -------------------------------------------------------
+# =========================================================
 # CoordinateBinner
-# -------------------------------------------------------
+# =========================================================
 class CoordinateBinner:
     def __init__(self, kappa=1.0, num_bins=200):
         self.kappa = kappa
@@ -34,9 +32,9 @@ class CoordinateBinner:
         return bin_centers_tensor[bin_index_tensor]
 
 
-# -------------------------------------------------------
-# Losses
-# -------------------------------------------------------
+# =========================================================
+# Loss Functions
+# =========================================================
 def cross_entropy_loss(predictions, targets, pad_token=2,
                        ignore_index=-100, label_smoothing=0.1):
     B, T, V = predictions.shape
@@ -58,9 +56,9 @@ def cross_entropy_loss(predictions, targets, pad_token=2,
     return loss
 
 
-# -------------------------------------------------------
-# DDP helpers
-# -------------------------------------------------------
+# =========================================================
+# DDP setup
+# =========================================================
 def setup_ddp():
     if not dist.is_initialized():
         dist.init_process_group("nccl")
@@ -78,19 +76,18 @@ def get_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
-# -------------------------------------------------------
+# =========================================================
 # Checkpointing
-# -------------------------------------------------------
+# =========================================================
 def save_best_checkpoint(model, optimizer, epoch, best_loss, batch_size, lr, model_config,
                          save_dir="./weights"):
     os.makedirs(save_dir, exist_ok=True)
     d_model = model_config["d_model"]
     n_heads = model_config["h"]
     n_layers = model_config["N"]
-    img_patch = model_config["img_patch"]
     checkpoint_path = os.path.join(
         save_dir,
-        f"d{d_model}_h{n_heads}_n{n_layers}_bs{batch_size}_lr{lr}_imgpatch{img_patch}_best_v2.pth"
+        f"latent_d{d_model}_h{n_heads}_n{n_layers}_bs{batch_size}_lr{lr}_best.pth"
     )
     torch.save(
         {
@@ -106,9 +103,10 @@ def save_best_checkpoint(model, optimizer, epoch, best_loss, batch_size, lr, mod
     )
     print(f"[Rank {get_rank()}] ✅ Saved best model at {checkpoint_path} (Val Loss: {best_loss:.6f})")
 
-# -------------------------------------------------------
+
+# =========================================================
 # Infer vocab size
-# -------------------------------------------------------
+# =========================================================
 def compute_vocab_from_dataset(dataset):
     max_token = -1
     for i in range(min(len(dataset), 5000)):
@@ -123,9 +121,9 @@ def compute_vocab_from_dataset(dataset):
     return vocab_size
 
 
-# -------------------------------------------------------
-# Training Loop
-# -------------------------------------------------------
+# =========================================================
+# Training
+# =========================================================
 def train(checkpoint_path=None, use_strict_resume=False):
     local_rank = setup_ddp()
     rank = get_rank()
@@ -135,22 +133,22 @@ def train(checkpoint_path=None, use_strict_resume=False):
     print(f"[Rank {rank}] Using device {device}")
     torch.set_float32_matmul_precision("medium")
 
-    # ----------------- Hyperparams -----------------
+    # ----------------- Hyperparameters -----------------
     batch_size = 512
     num_epochs = 700
     lr = 3e-4
-    mse_weight = 1.0
     seq_len = 17
     NUM_BINS = 201
     NUM_MECH_TYPES = 17
-    NUM_SPECIAL_TOKENS = 3  # SOS, EOS, PAD
+    NUM_SPECIAL_TOKENS = 3
     PAD_TOKEN = 2
     BIN_OFFSET = NUM_SPECIAL_TOKENS
+    LATENT_DIM = 50  # <-- from VAE
 
     # ----------------- Dataset -----------------
     dataset = BarLinkageDataset(data_dir="/home/anurizada/Documents/processed_dataset_17")
     vocab_size = compute_vocab_from_dataset(dataset)
-
+    print(vocab_size)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -169,27 +167,27 @@ def train(checkpoint_path=None, use_strict_resume=False):
         "N": 6,
         "num_labels": NUM_MECH_TYPES,
         "vocab_size": vocab_size + NUM_SPECIAL_TOKENS,
-        "img_patch": 8,
+        "latent_dim": LATENT_DIM,
         "dropout": 0.1,
         "pad_token_id": PAD_TOKEN,
     }
 
-    model = SingleImageTransformerCLIP(
+    model = SingleLatentTransformer(  # now latent-based
         tgt_seq_len=model_config["tgt_seq_len"],
         d_model=model_config["d_model"],
         h=model_config["h"],
         N=model_config["N"],
         num_labels=model_config["num_labels"],
         vocab_size=model_config["vocab_size"],
-        img_patch=model_config["img_patch"],
+        latent_dim=model_config["latent_dim"],
         dropout=model_config["dropout"],
         pad_token_id=model_config["pad_token_id"],
-        debug=False,
+        noise_std=0.05,
+        debug=True,
     ).to(device)
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     binner = CoordinateBinner(kappa=1.0, num_bins=NUM_BINS)
-
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
     best_loss = float("inf")
@@ -199,7 +197,7 @@ def train(checkpoint_path=None, use_strict_resume=False):
     if rank == 0:
         wandb.init(
             project="bar-linkage-transformer",
-            name=f"LMBD_ce_mse_d{model_config['d_model']}_h{model_config['h']}_n{model_config['N']}_lr{lr}_bs{batch_size}_imgpatch{model_config['img_patch']}_v2",
+            name=f"LMBD_latent_d{model_config['d_model']}_h{model_config['h']}_n{model_config['N']}_lr{lr}_bs{batch_size}",
             config=model_config,
         )
 
@@ -212,7 +210,9 @@ def train(checkpoint_path=None, use_strict_resume=False):
         best_loss = checkpoint.get("best_loss", float("inf"))
         print(f"[Rank {rank}] 🔁 Resumed from {checkpoint_path} (epoch {start_epoch})")
 
-    # ----------------- Training Loop -----------------
+    # =========================================================
+    # Training Loop
+    # =========================================================
     for epoch in range(start_epoch, num_epochs):
         if isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
@@ -222,18 +222,18 @@ def train(checkpoint_path=None, use_strict_resume=False):
 
         with tqdm(total=len(train_loader), desc=f"[Rank {rank}] Train {epoch}", disable=rank != 0) as pbar:
             for batch in train_loader:
+                latents = batch["vae_mu"].to(device)                # <-- direct from dataset
                 decoder_input = batch["decoder_input_discrete"].to(device)
                 decoder_mask = batch["causal_mask"].to(device).bool()
-                images = batch["images"].to(device)
                 mech_labels = batch["encoded_labels"].to(device)
                 target_tokens = batch["labels_discrete"].to(device)
 
                 optimizer.zero_grad()
-                predictions = model(decoder_input, decoder_mask, images, mech_labels)
+                predictions = model(decoder_input, decoder_mask, latents, mech_labels)
 
                 ce_loss = cross_entropy_loss(predictions, target_tokens, pad_token=PAD_TOKEN)
 
-                # Numeric MSE
+                # Compute numeric MSE
                 pred_tokens = predictions.argmax(dim=-1)
                 pred_bin_rel = pred_tokens - BIN_OFFSET
                 target_bin_rel = target_tokens - BIN_OFFSET
@@ -250,11 +250,10 @@ def train(checkpoint_path=None, use_strict_resume=False):
                 else:
                     mse_loss = torch.tensor(0.0, device=device)
 
-                total_loss = ce_loss
+                total_loss = ce_loss + mse_loss
                 total_loss.backward()
                 optimizer.step()
 
-                # Accuracy
                 valid_mask = target_tokens != PAD_TOKEN
                 correct = ((pred_tokens == target_tokens) & valid_mask).sum().float()
                 batch_acc = correct / (valid_mask.sum().float() + 1e-12)
@@ -275,19 +274,21 @@ def train(checkpoint_path=None, use_strict_resume=False):
                 pbar.set_postfix({"Loss": total_loss.item(), "Acc": batch_acc.item()})
                 pbar.update(1)
 
-        # ----------------- Validation -----------------
+        # =========================================================
+        # Validation
+        # =========================================================
         model.eval()
         val_loss, val_ce, val_mse, val_acc = 0.0, 0.0, 0.0, 0.0
         with torch.no_grad():
             with tqdm(total=len(val_loader), desc=f"[Rank {rank}] Val {epoch}", disable=rank != 0) as pbar:
                 for batch in val_loader:
+                    latents = batch["vae_mu"].to(device)            # <-- direct from dataset
                     decoder_input = batch["decoder_input_discrete"].to(device)
                     decoder_mask = batch["causal_mask"].to(device).bool()
-                    images = batch["images"].to(device)
                     mech_labels = batch["encoded_labels"].to(device)
                     target_tokens = batch["labels_discrete"].to(device)
 
-                    predictions = model(decoder_input, decoder_mask, images, mech_labels)
+                    predictions = model(decoder_input, decoder_mask, latents, mech_labels)
                     ce_loss = cross_entropy_loss(predictions, target_tokens, pad_token=PAD_TOKEN)
 
                     pred_tokens = predictions.argmax(dim=-1)
@@ -306,7 +307,7 @@ def train(checkpoint_path=None, use_strict_resume=False):
                     else:
                         mse_loss = torch.tensor(0.0, device=device)
 
-                    total_loss = ce_loss + mse_weight * mse_loss
+                    total_loss = ce_loss + mse_loss
 
                     valid_mask = target_tokens != PAD_TOKEN
                     correct = ((pred_tokens == target_tokens) & valid_mask).sum().float()
