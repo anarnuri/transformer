@@ -142,7 +142,7 @@ def train(checkpoint_path=None, use_strict_resume=False):
         "tgt_seq_len": seq_len,
         "d_model": 512,
         "h": 8,
-        "N": 1,
+        "N": 6,
         "num_labels": NUM_MECH_TYPES,
         "vocab_size": vocab_size,
         "img_patch": 8,
