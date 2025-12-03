@@ -4,5 +4,6 @@ __pycache__/
 .vscode/
 wandb/
 JavascriptCode/
+ALL_*/
 
 *.npy

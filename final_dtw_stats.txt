@@ -1,0 +1,4 @@
+Total Predictions: 357
+Average DTW: 2.512585643212016
+DTW < 2 count: 136
+Percent < 2: 38.095238095238095

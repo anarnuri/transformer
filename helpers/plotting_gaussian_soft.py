@@ -34,14 +34,14 @@ def plot_soft_targets(true_bin=100, num_bins=201, temps=[0.5, 1.0, 2.0, 4.0]):
     plt.xlabel("Bin index")
     plt.ylabel("Soft target probability")
     plt.legend()
-    plt.grid(True)
+    plt.grid(False)
     plt.show()
 
 
 if __name__ == "__main__":
     # Change these params if you want
     plot_soft_targets(
-        true_bin=20,          # center position
+        true_bin=100,          # center position
         num_bins=201,
-        temps=[0.5, 1.0, 2.0, 4.0]   # multiple temperatures
+        temps=[2.0, 3.0, 4.0, 5.0, 10.0]   # multiple temperatures
     )
